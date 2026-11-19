@@ -5,7 +5,7 @@ rclone crypt mount on CachyOS/Arch Linux x86-64.
 
 ## Back up
 
-Keep `backup-teldrive.sh` and `restore-teldrive.sh` together. With the USB mounted:
+Keep `backup-teldrive.sh`, `restore.sh`, and `restore-teldrive.sh` together. With the USB mounted:
 
 ```bash
 bash backup-teldrive.sh
