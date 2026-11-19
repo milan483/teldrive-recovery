@@ -58,18 +58,34 @@ install -m 600 "$kit/config/.env" "$root/.env"
 install -m 600 "$kit/config/rclone.conf" "$config"
 install -m 600 "$kit/config/rclone-crypt-recovery.txt" "$root/"
 install -m 755 "$kit/bin/rclone-teldrive" "$HOME/.local/bin/"
+# Strict rootless Podman rejects unqualified image names; normalize old kits too.
+sed -i \
+	-e 's#image: postgres:18-alpine#image: docker.io/library/postgres:18-alpine#' \
+	-e 's#image: postgres:17-alpine#image: docker.io/library/postgres:17-alpine#' \
+	-e 's#image: postgres:16-alpine#image: docker.io/library/postgres:16-alpine#' \
+	"$root/compose.yaml"
 compose() { podman compose -p teldrive -f "$root/compose.yaml" "$@"; }
+service_exec() {
+	local service=$1
+	shift
+	local container
+	container=$(podman ps -q \
+		--filter "label=io.podman.compose.project=teldrive" \
+		--filter "label=io.podman.compose.service=${service}" | head -n1)
+	[[ -n "$container" ]] || die "container for service is not running: $service"
+	podman exec -i "$container" "$@"
+}
 compose up -d postgres
 ready=false
 for ((attempt=0; attempt<60; attempt++)); do
-	if compose exec -T postgres pg_isready -U teldrive -d teldrive >/dev/null 2>&1; then
+	if service_exec postgres pg_isready -U teldrive -d teldrive >/dev/null 2>&1; then
 		ready=true
 		break
 	fi
 	sleep 2
 done
 $ready || die 'PostgreSQL did not become ready; inspect container logs'
-compose exec -T postgres psql -v ON_ERROR_STOP=1 -U teldrive -d teldrive < "$kit/database/teldrive.sql"
+service_exec postgres psql -v ON_ERROR_STOP=1 -U teldrive -d teldrive < "$kit/database/teldrive.sql"
 compose up -d
 ready=false
 for ((attempt=0; attempt<60; attempt++)); do

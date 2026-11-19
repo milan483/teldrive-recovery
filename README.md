@@ -38,6 +38,20 @@ enables the encrypted mount. Internet access is required; Telegram may require
 reauthentication. A failed restore retains its data for diagnosis and is not
 automatically resumable.
 
+If a restore is interrupted before completion on a genuinely fresh computer,
+remove only the partial paths listed by the error, then rerun the script:
+
+```bash
+rm -rf ~/.local/share/teldrive ~/.local/bin/rclone-teldrive
+rm -f ~/.config/rclone/rclone.conf
+rm -f ~/.config/systemd/user/teldrive-server.service
+rm -f ~/.config/systemd/user/teldrive-mount.service
+```
+
+Use those cleanup commands only when this computer has no existing TelDrive or
+rclone setup you need to preserve. The restore script also normalizes the old
+short `postgres:18-alpine` image name for strict rootless Podman installations.
+
 ## Limits and security
 
 - This is a recovery kit for access to Telegram-hosted files, **not an independent

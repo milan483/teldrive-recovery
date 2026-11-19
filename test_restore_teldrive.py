@@ -74,6 +74,10 @@ class RestoreChecks(unittest.TestCase):
         self.assertIn("refusing to overwrite", result.stderr)
         self.assertEqual(config.read_text(), "existing")
 
+    def test_script_normalizes_short_postgres_image(self):
+        script = (self.kit / "restore.sh").read_text()
+        self.assertIn("docker.io/library/postgres:18-alpine", script)
+
 
 if __name__ == "__main__":
     unittest.main()
