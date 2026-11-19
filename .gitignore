@@ -1,0 +1,8 @@
+.env
+*.7z
+*.zip
+*.sql
+rclone.conf
+*recovery.txt
+backup-staging.*/
+__pycache__/
