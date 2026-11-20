@@ -12,8 +12,8 @@ bash backup-teldrive.sh
 ```
 
 The default destination is `/run/media/kylan/netac/Obsidian USB`. An optional
-first argument changes the output directory; the script still requires the
-expected `/run/media/kylan/netac` USB mount. Adjust these paths for another host.
+first argument changes the output directory. Use `--require-mount /mount/path`
+to specify a different real mountpoint (the destination must be inside it).
 
 Enter a strong non-empty password at the 7-Zip prompts, then enter it again to
 test the archive. Store that password separately from the USB.
@@ -24,21 +24,23 @@ all configured rclone remotes, crypt recovery keys, the custom rclone binary,
 service files, checksums, and an automatic restore script. Container images are
 pinned to the running image digests.
 
-## Versioned file backups (optional Phase 1)
+## Versioned and scheduled file backups (optional Phases 1–2)
 
 Start with [the operation and maintenance overview](docs/OVERVIEW.md) for this
 machine's profiles, everyday commands, read-only browsing, restores and recovery
 precautions.
 
-See [the backup workflow](docs/BACKUP-WORKFLOW.md) for manually selected directory
+See [the backup workflow](docs/BACKUP-WORKFLOW.md) for selected directory
 profiles, encrypted Restic snapshots through the custom TelDrive rclone backend,
-and safe restores to a separate directory. This complements, rather than replaces,
-the USB recovery kit. No scheduling, automatic recovery-kit backup, or pruning is
-enabled.
+safe restores, and opt-in per-profile user-systemd scheduling with bounded
+network retries and optional KDE notifications. A separate optional timer can
+create recovery kits encrypted with an offline `age` recipient. Neither timer
+is installed/enabled until you explicitly enable it. No pruning is enabled.
 
 ## Restore on a replacement computer
 
-1. Install 7-Zip and extract the recovery archive using its password.
+1. For `.7z` archives use 7-Zip and the password. For `.tar.age` archives
+   decrypt with your offline age identity and extract the tar privately.
 2. Open a terminal in the extracted folder.
 3. Run `bash restore.sh` as your normal desktop user, not with sudo.
 4. Approve missing-package installation if needed.
@@ -94,6 +96,7 @@ short `postgres:18-alpine` image name for strict rootless Podman installations.
 ```bash
 bash -n backup-teldrive.sh restore-teldrive.sh
 python3 test_restore_teldrive.py
+python3 -m unittest -q test_teldrive_backup.py test_teldrive_phase2.py
 ```
 
 The tests validate kit checksums and overwrite protection without starting

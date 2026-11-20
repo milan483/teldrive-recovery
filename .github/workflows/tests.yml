@@ -18,8 +18,8 @@ jobs:
           python-version: '3.12'
       - name: Check Python and Bash syntax
         run: |
-          python -m py_compile teldrive_backup.py test_teldrive_backup.py test_teldrive_backup_integration.py test_restore_teldrive.py
+          python -m py_compile teldrive_backup.py test_teldrive_backup.py test_teldrive_backup_integration.py test_restore_teldrive.py test_teldrive_phase2.py
           bash -n backup-teldrive.sh restore-teldrive.sh restore.sh
       - name: Run offline unit tests
         run: |
-          python -m unittest -v test_restore_teldrive.py test_teldrive_backup.py test_teldrive_backup_integration.py
+          python -m unittest -v test_restore_teldrive.py test_teldrive_backup.py test_teldrive_backup_integration.py test_teldrive_phase2.py

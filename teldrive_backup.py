@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Opt-in Restic backups through the rclone TelDrive backend.
 
-Phase 1: profile selection, repository initialization, snapshots and safe restore.
-This program does not install services, schedule jobs, or prune snapshots.
+Profile snapshots, safe restore, and explicitly enabled user-systemd timers.
+This tool never prunes snapshots or automatically enables new schedules.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -28,10 +29,20 @@ from pathlib import Path
 DEFAULT_CONFIG = "~/.config/teldrive-backup/config.toml"
 PROFILE_RE = re.compile(r"^[a-z][a-z0-9_-]{0,39}$")
 BANDWIDTH_RE = re.compile(r"^[0-9]+(?:[KMGTP]|[kmgpt])?(?::[0-9]+(?:[KMGTP]|[kmgpt])?)?$")
+SCHEDULES = {"hourly", "daily", "weekly"}
+MANAGED_UNIT_MARKER = "# Managed by teldrive-backup schedule.\n"
 
 
 class BackupError(Exception):
     """An expected configuration, preflight, or backup failure."""
+
+
+class ResticFailure(BackupError):
+    """Sanitized Restic failure; only known network failures are retried."""
+
+    def __init__(self, reason: str, returncode: int):
+        super().__init__(f"restic exited with code {returncode}: {reason}; raw backend output withheld")
+        self.retryable = reason == "network or TelDrive connection failure"
 
 
 @dataclass(frozen=True)
@@ -41,6 +52,24 @@ class Profile:
     excludes: tuple[str, ...]
     one_file_system: bool
     required_mounts: tuple[Path, ...]
+    schedule: str | None = None
+
+
+@dataclass(frozen=True)
+class Automation:
+    max_attempts: int = 3
+    retry_delay_seconds: int = 30
+    notify_success: bool = False
+    notify_failure: bool = True
+
+
+@dataclass(frozen=True)
+class Recovery:
+    script: Path
+    destination: Path
+    required_mount: Path
+    age_recipient: str
+    schedule: str | None
 
 
 @dataclass(frozen=True)
@@ -51,6 +80,8 @@ class Settings:
     bandwidth_limit: str | None
     blocked_sources: tuple[Path, ...]
     profiles: dict[str, Profile]
+    automation: Automation = Automation()
+    recovery: Recovery | None = None
 
 
 def expand_path(value: str, field: str, *, resolve: bool = True) -> Path:
@@ -70,6 +101,14 @@ def string_list(value: object, field: str, *, nonempty: bool = False) -> tuple[s
     return tuple(value)
 
 
+def optional_schedule(value: object, field: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in SCHEDULES:
+        raise BackupError(f"{field} must be hourly, daily, or weekly")
+    return value
+
+
 def load_settings(config_path: Path) -> Settings:
     try:
         with config_path.open("rb") as handle:
@@ -79,8 +118,8 @@ def load_settings(config_path: Path) -> Settings:
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise BackupError(f"cannot read config {config_path}: {exc}") from exc
 
-    if not isinstance(data, dict) or set(data) - {"repository", "safety", "profiles"}:
-        raise BackupError("config requires only [repository], [safety], and [[profiles]]")
+    if not isinstance(data, dict) or set(data) - {"repository", "safety", "profiles", "automation", "recovery"}:
+        raise BackupError("unknown top-level config section")
     repo = data.get("repository")
     if not isinstance(repo, dict):
         raise BackupError("missing [repository] section")
@@ -113,7 +152,7 @@ def load_settings(config_path: Path) -> Settings:
         raise BackupError("configure at least one [[profiles]] entry")
     profiles: dict[str, Profile] = {}
     for item in profiles_raw:
-        if not isinstance(item, dict) or set(item) - {"name", "sources", "excludes", "one_file_system", "required_mounts"}:
+        if not isinstance(item, dict) or set(item) - {"name", "sources", "excludes", "one_file_system", "required_mounts", "schedule"}:
             raise BackupError("unknown [[profiles]] setting")
         name = item.get("name")
         if not isinstance(name, str) or not PROFILE_RE.fullmatch(name):
@@ -137,8 +176,43 @@ def load_settings(config_path: Path) -> Settings:
         for mount in required_mounts:
             if mount == Path("/") or not any(is_inside(source, mount) for source in sources):
                 raise BackupError(f"{name}: each required mount must contain a selected source directory and cannot be /")
-        profiles[name] = Profile(name, sources, excludes, one_fs, required_mounts)
-    return Settings(url, program, password_file, bandwidth, blocked_paths, profiles)
+        profiles[name] = Profile(name, sources, excludes, one_fs, required_mounts,
+                                 optional_schedule(item.get("schedule"), f"{name}.schedule"))
+
+    automation_raw = data.get("automation", {})
+    if not isinstance(automation_raw, dict) or set(automation_raw) - {"max_attempts", "retry_delay_seconds", "notify_success", "notify_failure"}:
+        raise BackupError("unknown [automation] setting")
+    max_attempts = automation_raw.get("max_attempts", 3)
+    delay = automation_raw.get("retry_delay_seconds", 30)
+    if type(max_attempts) is not int or not 1 <= max_attempts <= 5:
+        raise BackupError("automation.max_attempts must be an integer between 1 and 5")
+    if type(delay) is not int or not 1 <= delay <= 300:
+        raise BackupError("automation.retry_delay_seconds must be an integer between 1 and 300")
+    for key, default in (("notify_success", False), ("notify_failure", True)):
+        if not isinstance(automation_raw.get(key, default), bool):
+            raise BackupError(f"automation.{key} must be true or false")
+    automation = Automation(max_attempts, delay, automation_raw.get("notify_success", False),
+                            automation_raw.get("notify_failure", True))
+
+    recovery_raw = data.get("recovery")
+    recovery = None
+    if recovery_raw is not None:
+        if not isinstance(recovery_raw, dict) or set(recovery_raw) - {"script", "destination", "required_mount", "age_recipient", "schedule"}:
+            raise BackupError("unknown [recovery] setting")
+        for key in ("script", "destination", "required_mount", "age_recipient"):
+            if key not in recovery_raw:
+                raise BackupError(f"recovery.{key} is required when [recovery] is configured")
+        script = expand_path(recovery_raw["script"], "recovery.script", resolve=False)
+        destination = expand_path(recovery_raw["destination"], "recovery.destination", resolve=False)
+        mount = expand_path(recovery_raw["required_mount"], "recovery.required_mount", resolve=False)
+        if mount == Path("/") or not is_inside(destination.resolve(), mount.resolve()):
+            raise BackupError("recovery.destination must be inside recovery.required_mount (not /)")
+        recipient = recovery_raw["age_recipient"]
+        if not isinstance(recipient, str) or not re.fullmatch(r"age1[023456789acdefghjklmnpqrstuvwxyz]{58}", recipient):
+            raise BackupError("recovery.age_recipient must be a single native age public key")
+        recovery = Recovery(script, destination, mount, recipient,
+                            optional_schedule(recovery_raw.get("schedule"), "recovery.schedule"))
+    return Settings(url, program, password_file, bandwidth, blocked_paths, profiles, automation, recovery)
 
 
 def is_inside(path: Path, parent: Path) -> bool:
@@ -314,7 +388,7 @@ def run_restic(settings: Settings, args: list[str], *, capture: bool = False) ->
                             stderr=subprocess.PIPE, check=False)
     if result.returncode != 0:
         reason = safe_error_reason(result.stderr or "", result.returncode)
-        raise BackupError(f"restic exited with code {result.returncode}: {reason}; raw backend output withheld")
+        raise ResticFailure(reason, result.returncode)
     return result.stdout or ""
 
 
@@ -421,6 +495,8 @@ def config_text(data: dict) -> str:
     def literal(value: object) -> str:
         if isinstance(value, bool):
             return "true" if value else "false"
+        if type(value) is int:
+            return str(value)
         if isinstance(value, list):
             return "[" + ", ".join(literal(item) for item in value) + "]"
         if isinstance(value, str):
@@ -428,7 +504,7 @@ def config_text(data: dict) -> str:
         raise BackupError("unsupported configuration value")
 
     lines = ["# Managed by teldrive-backup dirs; manual edits are supported."]
-    for section in ("repository", "safety"):
+    for section in ("repository", "safety", "automation", "recovery"):
         if section in data:
             lines.extend(["", f"[{section}]"])
             lines.extend(f"{key} = {literal(value)}" for key, value in data[section].items())
@@ -523,6 +599,183 @@ def directory_menu(config_path: Path, settings: Settings) -> None:
     edit_directory(config_path, "add" if action == "a" else "remove", name, source)
 
 
+def notify_desktop(title: str, message: str, *, failure: bool = False) -> None:
+    """Best-effort user-bus notification. Never include backend output or paths."""
+    if not (os.environ.get("XDG_RUNTIME_DIR") or os.environ.get("DBUS_SESSION_BUS_ADDRESS")):
+        return
+    program = shutil.which("notify-send")
+    if not program:
+        return
+    try:
+        subprocess.run([program, "--app-name=TelDrive Backup", "--urgency=critical" if failure
+                        else "--urgency=normal", title, message],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       check=False, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        pass  # Journal output remains the authoritative result.
+
+
+def execute_backup(settings: Settings, profile: Profile, *, dry_run: bool = False,
+                   scheduled: bool = False) -> None:
+    command = ["backup", "--tag", f"teldrive-backup:{profile.name}"]
+    if dry_run:
+        command.append("--dry-run")
+    if profile.one_file_system:
+        command.append("--one-file-system")
+    for exclusion in profile.excludes:
+        command.extend(["--exclude", exclusion])
+    for blocked in settings.blocked_sources:
+        if any(is_inside(blocked, source) for source in profile.sources):
+            command.extend(["--exclude", str(blocked)])
+    command.extend(["--", *(str(source) for source in profile.sources)])
+
+    try:
+        with exclusive_backup_lock():
+            preflight_sources(settings, profile)
+            if dry_run:
+                result = run_restic(settings, ["--json", *command], capture=True)
+            else:
+                attempts = settings.automation.max_attempts if scheduled else 1
+                for attempt in range(1, attempts + 1):
+                    preflight_sources(settings, profile)
+                    try:
+                        run_restic(settings, command)
+                        break
+                    except ResticFailure as exc:
+                        if not exc.retryable or attempt == attempts:
+                            raise
+                        wait = min(settings.automation.retry_delay_seconds * 2 ** (attempt - 1), 300)
+                        print(f"Network failure on attempt {attempt}/{attempts}; retrying in {wait}s.",
+                              file=sys.stderr, flush=True)
+                        time.sleep(wait)
+        if dry_run:
+            print(backup_summary(result))
+            print("Dry run complete; no snapshot written.")
+        else:
+            print(f"Backup complete: {profile.name}")
+            if scheduled and settings.automation.notify_success:
+                notify_desktop("TelDrive backup complete", f"Profile {profile.name} saved.")
+    except (BackupError, OSError):
+        if scheduled and settings.automation.notify_failure:
+            notify_desktop("TelDrive backup failed", f"Profile {profile.name} failed. Check the user journal.", failure=True)
+        raise
+
+
+def run_recovery_kit(settings: Settings) -> None:
+    recovery = settings.recovery
+    if recovery is None:
+        raise BackupError("configure [recovery] before running an unattended recovery kit")
+    if not recovery.script.is_file() or recovery.script.is_symlink():
+        raise BackupError("recovery.script must be a regular non-symlink file")
+    require_program("bash", "bash")
+    with exclusive_backup_lock():
+        args = ["bash", str(recovery.script), "--age-recipient", recovery.age_recipient,
+                "--require-mount", str(recovery.required_mount), str(recovery.destination)]
+        try:
+            result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    check=False, text=True)
+        except OSError as exc:
+            raise BackupError("cannot start unattended recovery kit") from exc
+        if result.returncode != 0:
+            if settings.automation.notify_failure:
+                notify_desktop("TelDrive recovery kit failed", "Check the user journal.", failure=True)
+            raise BackupError(f"recovery kit failed (exit {result.returncode}); raw output withheld")
+    print("Encrypted recovery kit complete. Keep the offline age identity safe.")
+    if settings.automation.notify_success:
+        notify_desktop("TelDrive recovery kit complete", "Encrypted recovery archive saved.")
+
+
+def systemd_argument(raw: str) -> str:
+    """Quote an ExecStart argument using systemd syntax, including %% specifiers."""
+    if not raw or any(ord(c) < 32 or ord(c) == 127 for c in raw):
+        raise BackupError("unsupported control character in systemd argument")
+    return '"' + raw.replace("%", "%%").replace("$", "$$").replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def user_unit_dir() -> Path:
+    return Path.home() / ".config/systemd/user"
+
+
+def managed_unit_write(path: Path, content: str) -> None:
+    if path.is_symlink():
+        raise BackupError(f"refusing to overwrite a symlinked unit: {path}")
+    if path.exists():
+        if not path.is_file() or not path.read_text(encoding="utf-8").startswith(MANAGED_UNIT_MARKER):
+            raise BackupError(f"refusing to overwrite an unmanaged unit: {path}")
+        if path.read_text(encoding="utf-8") == content:
+            return
+    fd, raw_path = tempfile.mkstemp(prefix=".teldrive-unit-", dir=path.parent)
+    candidate = Path(raw_path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(candidate, path)
+    finally:
+        candidate.unlink(missing_ok=True)
+
+
+def systemctl_user(*args: str) -> None:
+    command = [require_program("systemctl", "systemctl"), "--user", *args]
+    result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                            check=False, text=True)
+    if result.returncode != 0:
+        raise BackupError(f"systemctl --user {args[0]} failed (exit {result.returncode}); "
+                          "check 'systemctl --user status' and the user journal")
+
+
+def schedule_unit(settings: Settings, config_path: Path, name: str,
+                  *, enable: bool, recovery_kit: bool = False) -> None:
+    if recovery_kit:
+        if settings.recovery is None:
+            raise BackupError("configure [recovery] first")
+        calendar = settings.recovery.schedule
+        unit_name = "teldrive-recovery-kit"
+        argv = ["recovery-kit", "run"]
+    else:
+        if name not in settings.profiles:
+            raise BackupError(f"unknown profile: {name}")
+        calendar = settings.profiles[name].schedule
+        unit_name = f"teldrive-backup@{name}"
+        argv = ["run", name, "--scheduled"]
+    timer = f"{unit_name}.timer"
+    unit_dir = user_unit_dir()
+    if enable:
+        if calendar is None:
+            raise BackupError("set a schedule (hourly, daily, weekly) in the config before enabling")
+        executable = Path.home() / ".local/bin/teldrive-backup"
+        if not executable.is_file() or not os.access(executable, os.X_OK):
+            raise BackupError(f"install teldrive_backup.py as executable {executable} first")
+        unit_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        service_text = (MANAGED_UNIT_MARKER + "[Unit]\nDescription=TelDrive backup: " + unit_name +
+                        "\n[Service]\nType=oneshot\nUMask=0077\nTimeoutStartSec=0\n"
+                        "Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin\nExecStart=" +
+                        " ".join(systemd_argument(v) for v in [str(executable), "--config", str(config_path), *argv]) + "\n")
+        timer_text = (MANAGED_UNIT_MARKER + f"[Unit]\nDescription=Schedule {unit_name}\n"
+                      f"[Timer]\nOnCalendar={calendar}\nPersistent=true\n"
+                      "RandomizedDelaySec=30m\nAccuracySec=5m\n"
+                      f"Unit={unit_name}.service\n[Install]\nWantedBy=timers.target\n")
+        # Inspect both targets before writing either to avoid partial collisions.
+        for unit in (f"{unit_name}.service", timer):
+            path = unit_dir / unit
+            if path.is_symlink() or (path.exists() and (not path.is_file() or
+                    not path.read_text(encoding="utf-8").startswith(MANAGED_UNIT_MARKER))):
+                raise BackupError(f"refusing to overwrite an unmanaged unit: {path}")
+        managed_unit_write(unit_dir / f"{unit_name}.service", service_text)
+        managed_unit_write(unit_dir / timer, timer_text)
+        systemctl_user("daemon-reload")
+        systemctl_user("enable", "--now", timer)
+        print(f"Enabled {timer} ({calendar}, persistent catch-up, up to 30m jitter).")
+    else:
+        # Refuse to touch a similarly named unit owned by another tool/user.
+        path = unit_dir / timer
+        if not path.is_file() or path.is_symlink() or not path.read_text(encoding="utf-8").startswith(MANAGED_UNIT_MARKER):
+            raise BackupError(f"no managed timer to disable: {path}")
+        systemctl_user("disable", "--now", timer)
+        print(f"Disabled {timer}. Existing snapshots and unit files are retained.")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=DEFAULT_CONFIG, help="TOML configuration file")
@@ -545,6 +798,16 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("profile", help="configured profile name")
         if name == "run":
             p.add_argument("--dry-run", action="store_true", help="estimate changed data without writing snapshots")
+            p.add_argument("--scheduled", action="store_true", help="enable bounded network retries and desktop notifications")
+    schedule = commands.add_parser("schedule", help="manage opt-in user-systemd timers")
+    schedule_commands = schedule.add_subparsers(dest="schedule_action", required=True)
+    schedule_commands.add_parser("list", help="list configured backup and recovery schedules")
+    for action in ("enable", "disable"):
+        p = schedule_commands.add_parser(action, help=f"{action} a profile's timer")
+        p.add_argument("profile")
+        schedule_commands.add_parser(f"{action}-recovery", help=f"{action} the recovery-kit timer")
+    recovery_kit = commands.add_parser("recovery-kit", help="create an age-encrypted unattended recovery archive")
+    recovery_kit.add_argument("action", choices=["run"])
     restore = commands.add_parser("restore", help="restore a profile version to a new/empty directory")
     restore.add_argument("profile")
     restore.add_argument("snapshot", help="snapshot ID/prefix or 'latest'")
@@ -567,6 +830,18 @@ def main(argv: list[str] | None = None) -> int:
                 edit_directory(config_path, args.directory_action, args.profile, args.source, assume_yes=args.yes)
         elif args.command == "keygen":
             generate_password(settings.password_file)
+        elif args.command == "schedule":
+            if args.schedule_action == "list":
+                for profile in settings.profiles.values():
+                    print(f"{profile.name}: {profile.schedule or 'manual only'}")
+                print(f"recovery-kit: {settings.recovery.schedule if settings.recovery and settings.recovery.schedule else 'manual only'}")
+                print("Schedules shown are configuration values, not timer activation state.")
+            elif args.schedule_action in {"enable-recovery", "disable-recovery"}:
+                schedule_unit(settings, config_path, "", enable=args.schedule_action == "enable-recovery", recovery_kit=True)
+            else:
+                schedule_unit(settings, config_path, args.profile, enable=args.schedule_action == "enable")
+        elif args.command == "recovery-kit":
+            run_recovery_kit(settings)
         elif args.command == "init":
             with exclusive_backup_lock():
                 run_restic(settings, ["init"])
@@ -586,31 +861,9 @@ def main(argv: list[str] | None = None) -> int:
             if profile is None:
                 raise BackupError(f"unknown profile: {args.profile}; available: {', '.join(settings.profiles)}")
             if args.command == "run":
-                preflight_sources(settings, profile)
-                command = ["backup", "--tag", f"teldrive-backup:{profile.name}"]
-                if args.dry_run:
-                    command.append("--dry-run")
-                if profile.one_file_system:
-                    command.append("--one-file-system")
-                for exclusion in profile.excludes:
-                    command.extend(["--exclude", exclusion])
-                # A broad source (such as ~/.) must never traverse a known
-                # TelDrive mount, even with one_file_system=false.
-                for blocked in settings.blocked_sources:
-                    if any(is_inside(blocked, source) for source in profile.sources):
-                        command.extend(["--exclude", str(blocked)])
-                command.extend(["--", *(str(source) for source in profile.sources)])
-                with exclusive_backup_lock():
-                    preflight_sources(settings, profile)
-                    if args.dry_run:
-                        result = run_restic(settings, ["--json", *command], capture=True)
-                    else:
-                        run_restic(settings, command)
-                if args.dry_run:
-                    print(backup_summary(result))
-                    print("Dry run complete; no snapshot written.")
-                else:
-                    print(f"Backup complete: {profile.name}")
+                if args.dry_run and args.scheduled:
+                    raise BackupError("--scheduled and --dry-run cannot be combined")
+                execute_backup(settings, profile, dry_run=args.dry_run, scheduled=args.scheduled)
             elif args.command == "snapshots":
                 snapshots = snapshot_list(settings, profile)
                 for s in sorted(snapshots, key=lambda x: x.get("time", ""), reverse=True):
