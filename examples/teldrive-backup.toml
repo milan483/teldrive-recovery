@@ -22,6 +22,8 @@ name = "documents"
 sources = ["~/Documents"]
 excludes = ["**/node_modules/**", "**/.cache/**"]
 one_file_system = true
+# For folders on removable HDDs/USBs, explicitly require the real mountpoint:
+# required_mounts = ["/mnt/HDD1"]
 
 # Uncomment after checking that the source directory exists:
 # [[profiles]]

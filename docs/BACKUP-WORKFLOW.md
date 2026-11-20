@@ -15,6 +15,9 @@ write snapshots using the custom `rclone-teldrive` binary.
 - Apply an optional basic rclone bandwidth limit.
 - Reject missing sources, blocked TelDrive mount sources, insecure password
   files, overlapping source paths, and ambiguous snapshot selections.
+- Optionally require specific source filesystems to be mounted before backing up.
+- Display a sanitized numeric transfer estimate during dry runs and safe error
+  categories on failure without revealing raw backend output.
 
 Not included yet: automatic scheduling, KDE notifications, retention/pruning,
 daily transfer budgets, metered-network detection, GUI, or unattended recovery
@@ -105,7 +108,14 @@ broad sources even while unmounted. Keep those paths configured; do not mount a
 new remote or replace source paths while a backup is running. This tool does not
 freeze the filesystem; application-consistent database backups need separate tooling.
 An unplugged source whose mountpoint still exists as an empty directory cannot
-be distinguished from an intentionally empty source; check removable mounts yourself.
+be distinguished from an intentionally empty source unless `required_mounts`
+is configured. For a profile whose source is `/mnt/HDD1/Documents`, set
+`required_mounts = ["/mnt/HDD1"]` in that profile's `[[profiles]]` block. The
+tool checks Linux mountinfo (including bind mounts) immediately before backup;
+it cancels if the required filesystem is absent. Every required mount must
+contain at least one of that profile's source paths. For removable data sets,
+set this explicitly even if the path usually exists while unplugged. Newly
+added sources are **not** automatically assigned a required mount.
 
 ## Restore a version safely
 
@@ -160,10 +170,13 @@ restoring: the local lock coordinates this tool, not arbitrary filesystem writer
 Use a named remote in a private rclone configuration, not inline connection strings
 or credentials in the repository URL. Password-file symlinks are refused; keep the
 password and configuration directories private. The tool suppresses child stdout,
-stderr and rclone logging rather than risk backend errors containing tokens. It
-reports Restic's exit code (including partial-backup failure) and only announces
-completion on success. Snapshot listings are parsed and validated, not raw logs.
-There is intentionally no per-file progress display. Do not enable shell tracing,
+and rclone logging rather than risk backend errors containing tokens. It collects
+child stderr privately for classification and prints only a predefined error
+category and exit code; raw messages, URLs, paths, tokens and headers are never
+reprinted. It only announces completion on success. Snapshot listings are parsed
+and validated, not raw logs. There is intentionally no per-file progress display.
+Dry-run summaries are parsed from documented Restic JSON numeric fields.
+Do not enable shell tracing,
 HTTP dumping, or external credential logging. A same-user/root attacker or a
 malicious executable/configuration is outside this tool's security boundary.
 
@@ -177,6 +190,11 @@ An optional `bandwidth_limit = "1M"` sets `RCLONE_BWLIMIT`, so the Restic
 transport is throttled to approximately 1 MiB/s. This is **not** 1 Mbps.
 Restic deduplicates unchanged content, but maintenance and metadata operations
 can still use network bandwidth. There is no daily byte cap yet.
+The `run PROFILE --dry-run` command now prints new/changed/unchanged file counts
+and estimated compressed/uncompressed added data. These are estimates of new
+repository data, **not exact on-the-wire bytes**; protocol overhead and retries
+can change actual bandwidth consumption. If the version of Restic returns no
+valid structured summary, the estimate is reported as unknown, never zero.
 
 The initial backup may upload nearly the entire selected data set. Run small
 test backups first. Verify these scenarios manually on a *disposable* remote

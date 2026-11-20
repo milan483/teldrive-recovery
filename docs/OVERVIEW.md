@@ -210,9 +210,10 @@ nano ~/.config/teldrive-backup/config.toml
 Changes apply to the next command; no backup service needs restarting.
 
 - **Sources:** change the `sources` list only deliberately. Verify new paths with
-  `profiles`, then a dry run. Missing directories fail the operation. An unplugged
-  drive leaving an empty mountpoint can look like a valid empty source, so check
-  that removable drives are actually mounted.
+  `profiles`, then a dry run. Missing directories fail the operation. For sources
+  on removable HDDs or USB drives, add `required_mounts = ["/mnt/HDD1"]` to the
+  relevant `[[profiles]]` block (using the real mountpoint) so an unplugged drive
+  cannot produce a misleading empty backup. The `dirs` menu does not infer it.
 - **Profiles:** keep names stable if you want continuous profile history. History
   is selected by `teldrive-backup:<name>` tags; renaming a profile does not retag
   existing snapshots.
@@ -221,7 +222,8 @@ Changes apply to the next command; no backup service needs restarting.
   include dependencies, build outputs, `.git` directories and local secrets if
   present; review size and sensitivity before the first upload.
 - **Bandwidth:** `bandwidth_limit = "1M"` limits transfers to approximately
-  1 MiB/s; `"0"` means unlimited.
+  1 MiB/s; `"0"` means unlimited. A dry run reports estimated added repository
+  bytes and file counts, not guaranteed on-the-wire transfer totals.
 - **Mount protection:** keep all known TelDrive mount paths in
   `safety.blocked_sources`. Active rclone and Restic browse mounts are also
   detected. Do not mount new remotes or replace paths during an operation.

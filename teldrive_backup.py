@@ -40,6 +40,7 @@ class Profile:
     sources: tuple[Path, ...]
     excludes: tuple[str, ...]
     one_file_system: bool
+    required_mounts: tuple[Path, ...]
 
 
 @dataclass(frozen=True)
@@ -112,7 +113,7 @@ def load_settings(config_path: Path) -> Settings:
         raise BackupError("configure at least one [[profiles]] entry")
     profiles: dict[str, Profile] = {}
     for item in profiles_raw:
-        if not isinstance(item, dict) or set(item) - {"name", "sources", "excludes", "one_file_system"}:
+        if not isinstance(item, dict) or set(item) - {"name", "sources", "excludes", "one_file_system", "required_mounts"}:
             raise BackupError("unknown [[profiles]] setting")
         name = item.get("name")
         if not isinstance(name, str) or not PROFILE_RE.fullmatch(name):
@@ -131,7 +132,12 @@ def load_settings(config_path: Path) -> Settings:
         one_fs = item.get("one_file_system", True)
         if not isinstance(one_fs, bool):
             raise BackupError(f"{name}.one_file_system must be true or false")
-        profiles[name] = Profile(name, sources, excludes, one_fs)
+        required_raw = string_list(item.get("required_mounts", []), f"{name}.required_mounts")
+        required_mounts = tuple(expand_path(p, f"{name}.required_mounts") for p in required_raw)
+        for mount in required_mounts:
+            if mount == Path("/") or not any(is_inside(source, mount) for source in sources):
+                raise BackupError(f"{name}: each required mount must contain a selected source directory and cannot be /")
+        profiles[name] = Profile(name, sources, excludes, one_fs, required_mounts)
     return Settings(url, program, password_file, bandwidth, blocked_paths, profiles)
 
 
@@ -156,8 +162,29 @@ def mounted_rclone_paths() -> tuple[Path, ...]:
     return tuple(paths)
 
 
+def mounted_directories() -> frozenset[Path]:
+    """Return kernel-reported mountpoints, including same-device bind mounts."""
+    paths = set()
+    for line in Path("/proc/self/mountinfo").read_text().splitlines():
+        before, after = line.split(" - ", 1)
+        fields = before.split()
+        if len(fields) < 5 or not after.split():
+            raise BackupError("cannot parse the kernel mount table")
+        if after.split()[0] == "autofs":
+            # An automount trigger isn't proof the underlying disk is present.
+            continue
+        mount = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), fields[4])
+        paths.add(Path(mount).resolve())
+    return frozenset(paths)
+
+
 def preflight_sources(settings: Settings, profile: Profile) -> None:
     mounts = mounted_rclone_paths()
+    if profile.required_mounts:
+        active_mounts = mounted_directories()
+        for required in profile.required_mounts:
+            if required not in active_mounts:
+                raise BackupError(f"{profile.name}: required filesystem is not mounted: {required}; backup cancelled")
     for source in profile.sources:
         if any(is_inside(source, mount) or is_inside(mount, source) for mount in mounts):
             raise BackupError(f"{profile.name}: source overlaps an active rclone/TelDrive mount: {source}")
@@ -217,15 +244,77 @@ def restic_env(settings: Settings) -> dict[str, str]:
     return env
 
 
+def safe_error_reason(stderr: str, returncode: int) -> str:
+    """Classify failures without reproducing potentially sensitive child output."""
+    message = stderr.casefold()
+    if returncode == 3:
+        return "incomplete backup (one or more source files could not be saved)"
+    categories = (
+        (("wrong password", "incorrect password", "no key found", "password is incorrect"),
+         "repository password or key mismatch"),
+        (("repository does not exist", "is there a repository", "unable to open config file"),
+         "repository missing or not initialized"),
+        (("already initialized", "already exists"), "repository already exists"),
+        (("repository is already locked", "unable to create lock", "already locked"),
+         "repository lock conflict"),
+        (("no space left on device", "storage quota exceeded", "insufficient storage"),
+         "storage space or quota exhausted"),
+        (("permission denied", "access denied", "unauthorized", "forbidden", "authentication required"),
+         "permission or remote authentication failure"),
+        (("connection refused", "network is unreachable", "no such host", "i/o timeout", "timed out", "tls handshake", "connection reset"),
+         "network or TelDrive connection failure"),
+    )
+    for needles, description in categories:
+        if any(needle in message for needle in needles):
+            return description
+    return "unclassified Restic or storage failure"
+
+
+def backup_summary(payload: str) -> str:
+    """Show only documented numeric fields from Restic JSON, never raw output."""
+    summary = None
+    for line in payload.splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict) and record.get("message_type") == "summary":
+            summary = record
+    if summary is None:
+        return "No structured Restic summary was available; upload estimate unknown."
+
+    def count(key: str) -> str:
+        value = summary.get(key)
+        return str(value) if type(value) is int and value >= 0 else "unknown"
+
+    def size(key: str) -> str:
+        value = summary.get(key)
+        if type(value) is not int or value < 0:
+            return "unknown"
+        amount = float(value)
+        for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+            if amount < 1024 or unit == "TiB":
+                return f"{amount:.1f} {unit}"
+            amount /= 1024
+        return "unknown"
+
+    return (f"Files: {count('files_new')} new, {count('files_changed')} changed, "
+            f"{count('files_unmodified')} unchanged. "
+            f"Estimated new repository data: {size('data_added_packed')} compressed "
+            f"({size('data_added')} before compression). "
+            "Actual network transfer can differ due to protocol overhead and retries.")
+
+
 def run_restic(settings: Settings, args: list[str], *, capture: bool = False) -> str:
     command = restic_command(settings) + args
     # Backend errors may include URLs, tokens or headers. Never relay arbitrary
     # child output to the terminal or a log (including successful warnings).
     result = subprocess.run(command, env=restic_env(settings), text=True,
                             stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, check=False)
+                            stderr=subprocess.PIPE, check=False)
     if result.returncode != 0:
-        raise BackupError(f"restic exited with code {result.returncode}; backend output suppressed to protect credentials")
+        reason = safe_error_reason(result.stderr or "", result.returncode)
+        raise BackupError(f"restic exited with code {result.returncode}: {reason}; raw backend output withheld")
     return result.stdout or ""
 
 
@@ -513,8 +602,15 @@ def main(argv: list[str] | None = None) -> int:
                 command.extend(["--", *(str(source) for source in profile.sources)])
                 with exclusive_backup_lock():
                     preflight_sources(settings, profile)
-                    run_restic(settings, command)
-                print("Dry run complete; no snapshot written." if args.dry_run else f"Backup complete: {profile.name}")
+                    if args.dry_run:
+                        result = run_restic(settings, ["--json", *command], capture=True)
+                    else:
+                        run_restic(settings, command)
+                if args.dry_run:
+                    print(backup_summary(result))
+                    print("Dry run complete; no snapshot written.")
+                else:
+                    print(f"Backup complete: {profile.name}")
             elif args.command == "snapshots":
                 snapshots = snapshot_list(settings, profile)
                 for s in sorted(snapshots, key=lambda x: x.get("time", ""), reverse=True):
