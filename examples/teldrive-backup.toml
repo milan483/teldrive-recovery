@@ -1,0 +1,31 @@
+# Copy to ~/.config/teldrive-backup/config.toml and edit for your computer.
+# This example is deliberately opt-in: nothing runs on a schedule.
+
+[repository]
+# Restic's rclone backend syntax: rclone:<configured-remote>:<repository-path>
+# This directory is dedicated to Restic. Do not sync unrelated files into it.
+url = "rclone:teldrive-crypt:backups/restic-cachyos"
+rclone_program = "~/.local/bin/rclone-teldrive"
+password_file = "~/.config/teldrive-backup/restic-password"
+
+# A conservative initial upload/download cap (MiB/s, not Mbps).
+# Set to "0" for unlimited; full scheduling/budget controls are Phase 3.
+bandwidth_limit = "1M"
+
+[safety]
+# Never back up the TelDrive mount into itself, even when selected by mistake.
+# Add any other TelDrive mount paths used on your machine.
+blocked_sources = ["~/Mounts/teldrive-crypt"]
+
+[[profiles]]
+name = "documents"
+sources = ["~/Documents"]
+excludes = ["**/node_modules/**", "**/.cache/**"]
+one_file_system = true
+
+# Uncomment after checking that the source directory exists:
+# [[profiles]]
+# name = "pictures"
+# sources = ["~/Pictures"]
+# excludes = []
+# one_file_system = true

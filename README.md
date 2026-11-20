@@ -24,6 +24,14 @@ all configured rclone remotes, crypt recovery keys, the custom rclone binary,
 service files, checksums, and an automatic restore script. Container images are
 pinned to the running image digests.
 
+## Versioned file backups (optional Phase 1)
+
+See [the backup workflow](docs/BACKUP-WORKFLOW.md) for manually selected directory
+profiles, encrypted Restic snapshots through the custom TelDrive rclone backend,
+and safe restores to a separate directory. This complements, rather than replaces,
+the USB recovery kit. No scheduling, automatic recovery-kit backup, or pruning is
+enabled.
+
 ## Restore on a replacement computer
 
 1. Install 7-Zip and extract the recovery archive using its password.
