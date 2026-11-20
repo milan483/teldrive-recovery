@@ -28,9 +28,11 @@ Backups access the remote directly; they do not write through your desktop mount
 Restic protects the backup contents, while the rclone crypt layer also encrypts
 the remote representation. Recovery requires both sets of access material.
 
-**Everything in Phase 1 is manual.** There is no backup schedule, notification
-system, automatic recovery-kit backup, retention policy, pruning, or deletion.
-The existing TelDrive server/mount services are separate from backup execution.
+**Phase 2 adds optional automation, but does not turn it on by default.** You
+can explicitly enable per-profile user-systemd timers, network retries and KDE
+notifications, and a separate age-encrypted recovery-kit timer. It does not
+introduce retention, pruning, data deletion, or transfer budgets. The existing
+TelDrive server/mount services remain separate from backup execution.
 
 ## 2. Your directories and installed files
 
@@ -84,6 +86,11 @@ teldrive-backup run pictures
 
 # Check a backup operation without creating a snapshot.
 teldrive-backup run coding --dry-run
+
+# After configuring a profile's `schedule` and validating a real backup:
+teldrive-backup schedule list
+teldrive-backup schedule enable coding
+# Disable later: teldrive-backup schedule disable coding
 
 # List each profile's saved versions.
 teldrive-backup snapshots documents

@@ -1,4 +1,4 @@
-# Phase 1: Versioned file backups through TelDrive
+# Phases 1–2: Versioned and scheduled file backups through TelDrive
 
 This optional file-backup tool complements `backup-teldrive.sh`. It does **not**
 replace the separate USB recovery kit for TelDrive's database, configuration,
@@ -18,10 +18,12 @@ write snapshots using the custom `rclone-teldrive` binary.
 - Optionally require specific source filesystems to be mounted before backing up.
 - Display a sanitized numeric transfer estimate during dry runs and safe error
   categories on failure without revealing raw backend output.
+- Opt-in per-profile user-systemd timers with missed-run catch-up and jitter.
+- Bounded retries only for recognized network failures, with optional KDE notifications.
+- Optional unattended TelDrive recovery kits encrypted to an offline age recipient.
 
-Not included yet: automatic scheduling, KDE notifications, retention/pruning,
-daily transfer budgets, metered-network detection, GUI, or unattended recovery
-kit encryption. Do not expect the tool to perform any of those tasks.
+Not included yet: retention/pruning, daily transfer budgets, metered-network
+detection, GUI, or automatic checks that recovery archives can actually decrypt.
 
 ## Requirements
 
@@ -50,6 +52,8 @@ Run from the `teldrive-recovery` repository after applying the Phase 1 files:
 sudo pacman -S --needed restic python
 mkdir -p ~/.config/teldrive-backup
 install -m 600 examples/teldrive-backup.toml ~/.config/teldrive-backup/config.toml
+mkdir -p ~/.local/bin
+install -m 755 teldrive_backup.py ~/.local/bin/teldrive-backup
 ```
 
 Edit the config to select existing directories and confirm the remote name,
@@ -95,6 +99,103 @@ Each snapshot receives a `teldrive-backup:<profile>` tag. Multiple profiles
 share a Restic repository, allowing reuse of data across profiles; history is
 filtered by tag. Each profile is still explicitly selected when running a
 backup. Backups do not delete source files or automatically expire snapshots.
+
+## Phase 2: Automatically back up selected directories
+
+Timers are **never enabled simply by changing configuration or installing the
+program**. Once your manual backup and restore are verified:
+
+1. In the `[[profiles]]` block for each chosen profile, set `schedule = "daily"`
+   (or `hourly` / `weekly`). Profiles without `schedule` remain manual-only.
+   For removable sources also set `required_mounts`, or an unplugged drive may
+   look like an empty directory and be saved as a misleading snapshot.
+2. Make sure the executable is installed in `~/.local/bin/teldrive-backup`
+   (see installation above). Then enable each desired timer:
+
+   ```bash
+   teldrive-backup schedule list
+   teldrive-backup schedule enable documents
+   systemctl --user list-timers 'teldrive-backup*'
+   journalctl --user -u 'teldrive-backup@documents.service' -n 50
+   ```
+
+3. To stop automatic backups without affecting snapshots or config:
+
+   ```bash
+   teldrive-backup schedule disable documents
+   ```
+
+Timers use systemd's `Persistent=true` to catch up after a missed schedule,
+with up to 30 minutes of randomized delay to spread traffic. User timers run
+while your user systemd manager is active. On machines that shut down or log
+out, they will run after the next login; enabling user lingering is optional,
+not done by this tool. A user desktop session must be active to see KDE popups.
+All results remain visible in the user journal if notifications aren't available.
+
+`[automation]` controls `max_attempts = 1..5` (default 3),
+`retry_delay_seconds = 1..300` (default 30, exponential backoff capped at 300s),
+`notify_success` (default false) and `notify_failure` (default true).
+Only `run PROFILE --scheduled`, as invoked by a timer, retries **known network
+or TelDrive connection failures**. Password mismatches, missing disks, locks,
+permission errors and incomplete source reads fail immediately. Retries hold the
+local operation lock, and use the same profile bandwidth limit. A network
+failure after a snapshot was committed may result in an additional duplicate
+snapshot; no existing snapshots are deleted. For debugging, manually trigger
+`teldrive-backup run documents --scheduled`. Never combine it with `--dry-run`.
+
+The generated service/timer files under `~/.config/systemd/user/` are managed
+by the CLI. It refuses to overwrite an existing unmanaged unit with the same
+name. If you change a schedule or install path, re-run `schedule enable NAME`.
+If you edit `teldrive_backup.py`, reinstall the copy in `~/.local/bin/`.
+
+## Phase 2: Optional unattended recovery kit (TelDrive DB and keys)
+
+The database, rclone crypt keys and TelDrive configuration still need an
+independent offline recovery kit; Restic snapshots alone **cannot** restore the
+remote backend after a PC loss. The traditional interactive `.7z` backup
+remains supported and still prompts for an archive password. For unattended
+creation, the new `--age-recipient` option encrypts to a public key without
+storing or using the private identity on the backup machine.
+
+On a *separate trusted machine*, install `age`, create an identity using
+`age-keygen -o identity.txt`, and put that private `identity.txt` somewhere
+offline and protected. Copy **only** its `age1...` public recipient into the
+`[recovery]` section of your TelDrive backup config. See the commented example.
+The recovery destination must already exist under a real mounted filesystem,
+and `required_mount` must be the actual mountpoint (not `/`). The script will
+abort when that disk is absent. Install `age` and ensure `podman`, the running
+TelDrive PostgreSQL container, rclone, and the original systemd services are
+available in the user session.
+
+```bash
+sudo pacman -S --needed age
+teldrive-backup recovery-kit run               # manually validate first
+teldrive-backup schedule enable-recovery      # opt in to the weekly timer
+systemctl --user list-timers 'teldrive-recovery-kit*'
+teldrive-backup schedule disable-recovery     # stop future kits
+```
+
+This creates `teldrive-recovery-YYYYMMDDTHHMMSSZ.tar.age` on the destination.
+Staging is private and temporary, and the final encrypted filename only appears
+after the encryption pipeline succeeds. It cannot validate the ciphertext by
+decrypting on the backup host: that host deliberately lacks the private key.
+On a separate trusted machine, periodically test extraction into a private
+directory (replace the filename and identity path):
+
+```bash
+age -d -i identity.txt -o recovery.tar teldrive-recovery-20261120T000000Z.tar.age
+mkdir -m 700 recovered-kit
+tar -xf recovery.tar -C recovered-kit
+(cd recovered-kit && sha256sum -c SHA256SUMS)
+# Follow recovered-kit/START-HERE.txt and test an actual replacement restore.
+```
+
+The decrypted tar, extracted `.env`, database dump, keys, and identity are
+sensitive. Keep them private, remove temporary plaintext copies securely where
+practical, and retain previous verified kits until the new one is tested.
+The tool does not prune old recovery kits; monitor USB space. No recovery
+timer or profile timer is enabled automatically and nothing is uploaded by
+`schedule enable` itself (other than whatever systemd later triggers).
 
 `one_file_system = true` prevents walking into other mounted filesystems from
 the selected source, but may also exclude nested Btrfs subvolumes. Add such
@@ -218,8 +319,8 @@ These are offline tests using temporary files and mocks; they do not require
 Telegram access and cannot establish that real backups or restores work:
 
 ```bash
-python3 -m py_compile teldrive_backup.py test_teldrive_backup.py
-python3 -m unittest -v test_teldrive_backup.py
+python3 -m py_compile teldrive_backup.py test_teldrive_backup.py test_teldrive_phase2.py
+python3 -m unittest -v test_teldrive_backup.py test_teldrive_phase2.py
 bash -n backup-teldrive.sh restore-teldrive.sh
 python3 test_restore_teldrive.py
 ```
@@ -236,6 +337,10 @@ Without Restic on PATH and an explicit binary, that test is skipped. It covers
 initial/repeated/modified backups, zero new file-data blobs for unchanged content,
 profile isolation, old/latest restores, missing sources, existing-target refusal,
 and `check --read-data`.
+The Phase 2 tests also exercise generated systemd units, retries, and the
+recovery-kit packaging flow with fake Podman and a fake age executable. They
+**do not** validate actual age encryption/decryption, KDE desktop delivery,
+or a real timer firing with a mounted removable drive.
 
 ### Validation on 2026-11-20
 
@@ -256,3 +361,5 @@ recovery and replacement-computer recovery were **not** exercised by this test.
 - Restic rclone backend: <https://restic.readthedocs.io/en/stable/030_preparing_a_new_repo.html>
 - Restic snapshots and content deduplication: <https://restic.readthedocs.io/en/stable/040_backup.html>
 - Rclone's Restic server: <https://rclone.org/commands/rclone_serve_restic/>
+- systemd user calendar timers and catch-up: <https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html>
+- age file-encryption CLI: <https://github.com/FiloSottile/age/blob/main/doc/age.1.html>

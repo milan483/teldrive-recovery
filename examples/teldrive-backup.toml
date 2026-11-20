@@ -17,11 +17,20 @@ bandwidth_limit = "1M"
 # Add any other TelDrive mount paths used on your machine.
 blocked_sources = ["~/Mounts/teldrive-crypt"]
 
+[automation]
+# Only --scheduled runs use retries and desktop notifications.
+max_attempts = 3
+retry_delay_seconds = 30
+notify_success = false
+notify_failure = true
+
 [[profiles]]
 name = "documents"
 sources = ["~/Documents"]
 excludes = ["**/node_modules/**", "**/.cache/**"]
 one_file_system = true
+# Add schedule = "daily" to opt in after configuring and reviewing sources.
+# Valid values: hourly, daily, weekly. A schedule alone does NOT enable a timer.
 # For folders on removable HDDs/USBs, explicitly require the real mountpoint:
 # required_mounts = ["/mnt/HDD1"]
 
@@ -31,3 +40,16 @@ one_file_system = true
 # sources = ["~/Pictures"]
 # excludes = []
 # one_file_system = true
+# schedule = "weekly"
+
+# Optional: encrypted TelDrive DB/keys recovery kit on a separately mounted USB.
+# Generate an OFFLINE identity using `age-keygen -o identity.txt` and store the
+# private identity OFFLINE; use only its age1... public recipient on this PC.
+# Must install `age` and set a valid mountpoint, destination and script path.
+# Run `teldrive-backup schedule enable-recovery` only after a manual kit test.
+# [recovery]
+# script = "/absolute/path/to/teldrive-recovery/backup-teldrive.sh"
+# destination = "/run/media/youruser/USB/recovery"
+# required_mount = "/run/media/youruser/USB"
+# age_recipient = "age1...copy-your-real-public-key-here..."
+# schedule = "weekly"

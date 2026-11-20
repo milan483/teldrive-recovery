@@ -3,9 +3,29 @@ set -Eeuo pipefail
 umask 077
 
 # Create an encrypted, independently restorable TelDrive recovery archive.
-# The archive password is entered interactively and is never written to disk.
+# Interactive mode uses 7z. --age-recipient enables unattended public-key encryption.
 
-readonly BACKUP_ROOT="${1:-/run/media/kylan/netac/Obsidian USB}"
+AGE_RECIPIENT=""
+REQUIRED_MOUNT="/run/media/kylan/netac"
+BACKUP_ROOT=""
+while (( $# )); do
+	case "$1" in
+		--age-recipient)
+			(( $# >= 2 )) || { printf 'error: --age-recipient needs a public key\n' >&2; exit 1; }
+			AGE_RECIPIENT="$2"; shift 2 ;;
+		--require-mount)
+			(( $# >= 2 )) || { printf 'error: --require-mount needs a path\n' >&2; exit 1; }
+			REQUIRED_MOUNT="$2"; shift 2 ;;
+		--help)
+			printf 'Usage: %s [--age-recipient age1...] [--require-mount /mounted/path] [destination]\n' "$0"; exit 0 ;;
+		-*) printf 'error: unknown option: %s\n' "$1" >&2; exit 1 ;;
+		*)
+			[[ -z "$BACKUP_ROOT" ]] || { printf 'error: only one destination is allowed\n' >&2; exit 1; }
+			BACKUP_ROOT="$1"; shift ;;
+	esac
+done
+BACKUP_ROOT="${BACKUP_ROOT:-/run/media/kylan/netac/Obsidian USB}"
+readonly AGE_RECIPIENT REQUIRED_MOUNT BACKUP_ROOT
 readonly TELDRIVE_ROOT="${HOME}/.local/share/teldrive"
 readonly RCLONE_CONFIG="${HOME}/.config/rclone/rclone.conf"
 readonly CRYPT_RECOVERY="${TELDRIVE_ROOT}/rclone-crypt-recovery.txt"
@@ -19,13 +39,24 @@ die() {
 	exit 1
 }
 
-command -v 7z >/dev/null || die "7z is required"
 command -v podman >/dev/null || die "podman is required"
 command -v python3 >/dev/null || die "python3 is required"
-[[ -t 0 && -t 1 ]] || die "run this script in an interactive terminal"
+if [[ -n "$AGE_RECIPIENT" ]]; then
+	[[ "$AGE_RECIPIENT" =~ ^age1[023456789acdefghjklmnpqrstuvwxyz]{58}$ ]] || die "--age-recipient must be a valid-looking native age public key"
+	command -v age >/dev/null || die "age is required for unattended encrypted recovery kits"
+	command -v tar >/dev/null || die "tar is required"
+else
+	command -v 7z >/dev/null || die "7z is required"
+	[[ -t 0 && -t 1 ]] || die "run this script in an interactive terminal or configure --age-recipient"
+fi
 
 [[ -d "$BACKUP_ROOT" ]] || die "backup destination is not mounted: $BACKUP_ROOT"
-mountpoint -q /run/media/kylan/netac || die "the expected USB filesystem is not mounted"
+[[ -d "$REQUIRED_MOUNT" ]] || die "required mount is missing: $REQUIRED_MOUNT"
+mountpoint -q -- "$REQUIRED_MOUNT" || die "the required filesystem is not mounted: $REQUIRED_MOUNT"
+resolved_destination=$(realpath -e -- "$BACKUP_ROOT")
+resolved_mount=$(realpath -e -- "$REQUIRED_MOUNT")
+[[ "$resolved_mount" != / ]] || die "refusing to use the root filesystem as the required mount"
+[[ "$resolved_destination" == "$resolved_mount" || "$resolved_destination" == "$resolved_mount/"* ]] || die "destination must be inside the required mounted filesystem"
 [[ -f "$COMPOSE_FILE" ]] || die "missing TelDrive compose file: $COMPOSE_FILE"
 [[ -f "$ENV_FILE" ]] || die "missing TelDrive environment file: $ENV_FILE"
 [[ -f "$RCLONE_CONFIG" ]] || die "missing rclone config: $RCLONE_CONFIG"
@@ -34,10 +65,16 @@ mountpoint -q /run/media/kylan/netac || die "the expected USB filesystem is not 
 [[ -f "$SCRIPT_DIR/restore-teldrive.sh" ]] || die "missing companion restore-teldrive.sh"
 
 timestamp=$(date -u +%Y%m%dT%H%M%SZ)
-archive="${BACKUP_ROOT}/teldrive-recovery-${timestamp}.7z"
+if [[ -n "$AGE_RECIPIENT" ]]; then
+	archive="${BACKUP_ROOT}/teldrive-recovery-${timestamp}.tar.age"
+else
+	archive="${BACKUP_ROOT}/teldrive-recovery-${timestamp}.7z"
+fi
 staging=$(mktemp -d "${TELDRIVE_ROOT}/backup-staging.XXXXXX")
 chmod 700 "$staging"
+partial=""
 cleanup() {
+	if [[ -n "$partial" ]]; then rm -f -- "$partial"; fi
 	rm -rf -- "$staging"
 }
 trap cleanup EXIT
@@ -78,7 +115,12 @@ podman compose -f "$COMPOSE_FILE" exec -T postgres \
 cat > "$staging/START-HERE.txt" <<'EOF'
 RESTORE ON A FRESH CACHYOS/ARCH LINUX X86-64 COMPUTER
 
-1. Install 7-Zip if needed and extract this archive using its password.
+1. Extract this archive to a private directory:
+   - For .7z: use 7-Zip and the archive password.
+   - For .tar.age: decrypt with your OFFLINE age private identity:
+     age -d -i identity.txt -o recovery.tar teldrive-recovery-*.tar.age
+     tar -xf recovery.tar
+     Securely delete the temporary recovery.tar when finished.
 2. Open a terminal in the extracted directory and run:
 
    bash restore.sh
@@ -102,7 +144,7 @@ rclone configuration, and rclone crypt recovery material.
 
 ## Restore outline
 
-1. Install Podman/Compose, FUSE 3, and 7-Zip on the replacement Linux computer.
+1. Install Podman/Compose, FUSE 3, and 7-Zip or age on the replacement computer.
 2. Extract this archive only into a protected directory.
    Run `sha256sum -c SHA256SUMS` from the extracted directory.
    The included rclone binary is Linux amd64; rebuild this fork for other platforms.
@@ -159,16 +201,27 @@ EOF
 (cd "$staging" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
 
 printf 'Creating %s\n' "$archive"
-printf 'Enter a strong non-empty password directly into 7-Zip and keep it separately.\n'
 [[ ! -e "$archive" ]] || die "archive already exists: $archive"
-(cd "$staging" && 7z a -t7z -mx=5 -mhe=on -p "$archive" .)
-chmod 600 "$archive"
-
-printf 'Testing archive integrity\n'
-printf 'Re-enter the archive password when prompted to verify it.\n'
-7z t "$archive"
+if [[ -n "$AGE_RECIPIENT" ]]; then
+	# Staging is private. Only ciphertext leaves this directory. Publish it after
+	# tar and age both succeed, never leave a partial archive with a final name.
+	partial=$(mktemp "${BACKUP_ROOT}/.teldrive-recovery-XXXXXXXX.tar.age")
+	(cd "$staging" && tar -cf - .) | age -r "$AGE_RECIPIENT" > "$partial"
+	[[ -s "$partial" ]] || die "age produced an empty encrypted archive"
+	chmod 600 "$partial"
+	mv -n -- "$partial" "$archive"
+	[[ ! -e "$partial" ]] || die "archive appeared while encrypting; refusing to overwrite"
+	partial=""
+	printf 'Encrypted with the configured public key. Full integrity requires an offline decryption test.\n'
+else
+	printf 'Enter a strong non-empty password directly into 7-Zip and keep it separately.\n'
+	(cd "$staging" && 7z a -t7z -mx=5 -mhe=on -p "$archive" .)
+	chmod 600 "$archive"
+	printf 'Testing archive integrity; re-enter the password when prompted.\n'
+	7z t "$archive"
+fi
 
 printf '\nCreated and verified:\n%s\n' "$archive"
 printf 'Size: '
 du -h --apparent-size "$archive" | cut -f1
-printf '\nKeep the archive password separately from the USB.\n'
+printf '\nKeep the password or age private identity separately from the archive.\n'
