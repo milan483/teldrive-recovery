@@ -1,0 +1,25 @@
+name: Offline backup and recovery tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check Python and Bash syntax
+        run: |
+          python -m py_compile teldrive_backup.py test_teldrive_backup.py test_teldrive_backup_integration.py test_restore_teldrive.py
+          bash -n backup-teldrive.sh restore-teldrive.sh restore.sh
+      - name: Run offline unit tests
+        run: |
+          python -m unittest -v test_restore_teldrive.py test_teldrive_backup.py test_teldrive_backup_integration.py

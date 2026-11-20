@@ -287,6 +287,77 @@ class BackupTests(unittest.TestCase):
             code, _, err = self.invoke("run", "documents", "--dry-run")
         self.assertEqual(code, 0, err)
         self.assertIn("--dry-run", run.call_args.args[1])
+        self.assertIn("--json", run.call_args.args[1])
+        self.assertTrue(run.call_args.kwargs["capture"])
+
+    def test_dry_run_reports_estimated_bytes_without_printing_raw_json(self):
+        payload = ('{"message_type":"summary","dry_run":true,"files_new":2,'
+                   '"files_changed":1,"files_unmodified":4,"data_added":4096,'
+                   '"data_added_packed":2048,"unsafe_field":"SECRET_TOKEN"}\n')
+        with patch.object(backup, "run_restic", return_value=payload):
+            code, output, err = self.invoke("run", "documents", "--dry-run")
+        self.assertEqual(code, 0, err)
+        self.assertIn("2.0 KiB", output)
+        self.assertIn("4.0 KiB", output)
+        self.assertIn("2 new, 1 changed, 4 unchanged", output)
+        self.assertNotIn("SECRET_TOKEN", output)
+
+    def test_dry_run_without_summary_does_not_claim_zero_upload(self):
+        with patch.object(backup, "run_restic", return_value='{"message_type":"status"}\n'):
+            code, output, err = self.invoke("run", "documents", "--dry-run")
+        self.assertEqual(code, 0, err)
+        self.assertIn("estimate unknown", output)
+
+    def test_required_mount_prevents_empty_disconnected_source_backup(self):
+        mount = self.root / "external"
+        source = mount / "documents"
+        source.mkdir(parents=True)
+        self.write_config(source=source)
+        self.config.write_text(self.config.read_text() + f'required_mounts = ["{mount}"]\n')
+        with (patch.object(backup, "mounted_rclone_paths", return_value=()),
+              patch.object(backup, "mounted_directories", return_value=frozenset({Path("/"), self.root})),
+              patch.object(backup, "run_restic") as run):
+            code, _, err = self.invoke("run", "documents")
+        self.assertEqual(code, 1)
+        self.assertIn("required filesystem is not mounted", err)
+        run.assert_not_called()
+
+        with (patch.object(backup, "mounted_rclone_paths", return_value=()),
+              patch.object(backup, "mounted_directories", return_value=frozenset({mount})),
+              patch.object(backup, "run_restic") as run):
+            code, _, err = self.invoke("run", "documents")
+        self.assertEqual(code, 0, err)
+        run.assert_called_once()
+
+    def test_required_mount_must_contain_source_and_cannot_be_root(self):
+        for mount in (self.root / "unrelated", Path("/")):
+            with self.subTest(mount=mount):
+                self.write_config()
+                self.config.write_text(self.config.read_text() + f'required_mounts = ["{mount}"]\n')
+                with self.assertRaisesRegex(backup.BackupError, "required mount"):
+                    self.load()
+
+    def test_mountinfo_parser_includes_bind_mounts(self):
+        table = "36 25 0:32 / /mnt/USB\\040Drive rw - ext4 /dev/sdb1 rw\n"
+        with patch.object(Path, "read_text", return_value=table):
+            self.assertEqual(backup.mounted_directories(), frozenset({Path("/mnt/USB Drive")}))
+
+    def test_automount_trigger_is_not_considered_a_connected_disk(self):
+        table = "36 25 0:32 / /mnt/USB rw - autofs systemd-1 rw\n"
+        with patch.object(Path, "read_text", return_value=table):
+            self.assertEqual(backup.mounted_directories(), frozenset())
+
+    def test_failure_categories_do_not_reveal_child_text(self):
+        for raw, expected in (("no such host: secret.invalid", "network"),
+                              ("wrong password: secret-value", "password"),
+                              ("repository is already locked by secret", "lock"),
+                              ("custom SECRET_TOKEN", "unclassified")):
+            with self.subTest(raw=raw):
+                reason = backup.safe_error_reason(raw, 1)
+                self.assertIn(expected, reason)
+                self.assertNotIn("SECRET_TOKEN", reason)
+                self.assertNotIn("secret-value", reason)
+        self.assertIn("incomplete", backup.safe_error_reason("token=secret", 3))
 
     def test_broad_source_excludes_nested_teldrive_mount(self):
         self.with_key()
