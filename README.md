@@ -36,6 +36,16 @@ and safe restores to a separate directory. This complements, rather than replace
 the USB recovery kit. No scheduling, automatic recovery-kit backup, or pruning is
 enabled.
 
+For the separately configured FreeFileSync mirror of Personal Documents, with
+timestamped version history and a five-minute RealTimeSync idle delay, see
+[the FreeFileSync operator guide](docs/FREEFILESYNC-PERSONAL-DOCUMENTS.md).
+This does not change the Restic workflow described above.
+
+Manage the FreeFileSync source list with `freefilesync-backup dirs list`,
+`freefilesync-backup dirs add "/absolute/source"`, and
+`freefilesync-backup dirs remove "/absolute/source"`. Removing an entry preserves
+its stored backup and version history.
+
 ## Restore on a replacement computer
 
 1. Install 7-Zip and extract the recovery archive using its password.
