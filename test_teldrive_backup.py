@@ -70,6 +70,128 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(s.profiles["documents"].sources, (self.documents,))
         self.assertTrue(s.profiles["documents"].one_file_system)
 
+    def test_dirs_add_new_profile_preserves_settings_and_private_original(self):
+        original = self.config.read_bytes()
+        before = self.load()
+        with patch.object(backup, "run_restic") as run:
+            code, _, err = self.invoke("dirs", "add", "projects", str(self.projects), "--yes")
+        self.assertEqual(code, 0, err)
+        run.assert_not_called()
+        after = self.load()
+        self.assertEqual(after.repository, before.repository)
+        self.assertEqual(after.password_file, before.password_file)
+        self.assertEqual(after.profiles["documents"], before.profiles["documents"])
+        self.assertEqual(after.profiles["projects"].sources, (self.projects,))
+        copies = list(self.root.glob("config.toml.before-dirs-*"))
+        self.assertEqual(len(copies), 1)
+        self.assertEqual(copies[0].read_bytes(), original)
+        self.assertEqual(copies[0].stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.config.stat().st_mode & 0o777, 0o600)
+
+    def test_dirs_add_and_remove_source_in_existing_profile(self):
+        self.assertEqual(self.invoke("dirs", "add", "documents", str(self.projects), "--yes")[0], 0)
+        self.assertEqual(len(self.load().profiles["documents"].sources), 2)
+        self.assertEqual(self.invoke("dirs", "remove", "documents", str(self.projects), "--yes")[0], 0)
+        self.assertEqual(self.load().profiles["documents"].sources, (self.documents,))
+        self.assertTrue(self.projects.is_dir())
+
+    def test_dirs_invalid_additions_preserve_config(self):
+        original = self.config.read_bytes()
+        for profile, source in [("bad name", self.projects), ("documents", self.documents),
+                                ("documents", self.documents / "nested"), ("new", self.root / "missing")]:
+            with self.subTest(profile=profile, source=source):
+                self.assertEqual(self.invoke("dirs", "add", profile, str(source), "--yes")[0], 1)
+                self.assertEqual(self.config.read_bytes(), original)
+        self.assertEqual(list(self.root.glob(".config-edit-*")), [])
+
+    def test_dirs_remove_final_profile_refused(self):
+        original = self.config.read_bytes()
+        code, _, err = self.invoke("dirs", "remove", "documents", str(self.documents), "--yes")
+        self.assertEqual(code, 1)
+        self.assertIn("last profile", err)
+        self.assertEqual(self.config.read_bytes(), original)
+
+    def test_dirs_remove_profile_with_missing_source_retains_history_and_data(self):
+        self.write_config(extra=f'\n[[profiles]]\nname="projects"\nsources=["{self.projects}"]\n')
+        self.projects.rmdir()
+        with patch.object(backup, "run_restic") as run:
+            code, out, err = self.invoke("dirs", "remove", "projects", str(self.projects), "--yes")
+        self.assertEqual(code, 0, err)
+        self.assertIn("saved history remains", out)
+        self.assertNotIn("projects", self.load().profiles)
+        run.assert_not_called()
+
+    def test_dirs_confirmation_cancel_and_concurrent_edit(self):
+        original = self.config.read_bytes()
+        with patch.object(backup.sys.stdin, "isatty", return_value=True), patch("builtins.input", return_value="n"):
+            self.assertEqual(self.invoke("dirs", "add", "projects", str(self.projects))[0], 0)
+        self.assertEqual(self.config.read_bytes(), original)
+        self.assertEqual(list(self.root.glob("config.toml.before-dirs-*")), [])
+        def concurrent_edit(prompt):
+            self.config.write_bytes(original + b"\n# concurrent edit\n")
+            return "y"
+        with patch.object(backup.sys.stdin, "isatty", return_value=True), patch("builtins.input", side_effect=concurrent_edit):
+            code, _, err = self.invoke("dirs", "add", "projects", str(self.projects))
+        self.assertEqual(code, 1)
+        self.assertIn("config changed", err)
+        self.assertEqual(self.config.read_bytes(), original + b"\n# concurrent edit\n")
+
+    def test_dirs_refuses_symlink_config(self):
+        link = self.root / "link.toml"
+        link.symlink_to(self.config)
+        original = self.config.read_bytes()
+        with contextlib.redirect_stderr(io.StringIO()):
+            code = backup.main(["--config", str(link), "dirs", "add", "projects", str(self.projects), "--yes"])
+        self.assertEqual(code, 1)
+        self.assertEqual(self.config.read_bytes(), original)
+
+    def test_dirs_interactive_menu(self):
+        with (patch.object(backup.sys.stdin, "isatty", return_value=True),
+              patch("builtins.input", side_effect=["a", "projects", str(self.projects), "y"])):
+            code, _, err = self.invoke("dirs")
+        self.assertEqual(code, 0, err)
+        self.assertIn("projects", self.load().profiles)
+
+    def test_dirs_roundtrips_special_paths(self):
+        special = self.root / 'quote"-backslash\\-日本語'
+        special.mkdir()
+        code, _, err = self.invoke("dirs", "add", "special", str(special), "--yes")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.load().profiles["special"].sources, (special,))
+
+    def test_dirs_refuses_remote_mount_addition(self):
+        original = self.config.read_bytes()
+        with patch.object(backup, "mounted_rclone_paths", return_value=(self.projects,)):
+            code, _, _ = self.invoke("dirs", "add", "projects", str(self.projects), "--yes")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.config.read_bytes(), original)
+
+    def test_browse_mounts_only_new_local_target(self):
+        target = self.root / "browse"
+        with patch.object(backup, "run_restic") as run:
+            code, _, err = self.invoke("browse", "--target", str(target))
+        self.assertEqual(code, 0, err)
+        self.assertTrue(target.is_dir())
+        self.assertEqual(run.call_args.args[1], ["mount", str(target)])
+
+    def test_browse_refuses_existing_data_and_sources(self):
+        for target in (self.projects, self.documents):
+            (target / "keep").write_text("existing data")
+            with patch.object(backup, "run_restic") as run:
+                code, _, _ = self.invoke("browse", "--target", str(target))
+            self.assertEqual(code, 1)
+            run.assert_not_called()
+            self.assertEqual((target / "keep").read_text(), "existing data")
+
+    def test_browse_refuses_already_mounted_empty_target(self):
+        target = self.root / "browse"
+        target.mkdir()
+        with patch.object(backup.os.path, "ismount", return_value=True), patch.object(backup, "run_restic") as run:
+            code, _, err = self.invoke("browse", "--target", str(target))
+        self.assertEqual(code, 1)
+        self.assertIn("already mounted", err)
+        run.assert_not_called()
+
     def test_invalid_repository_url_rejected(self):
         self.write_config(repository="teldrive-crypt:")
         with self.assertRaisesRegex(backup.BackupError, "repository.url"):
@@ -342,6 +464,11 @@ class BackupTests(unittest.TestCase):
         table = "36 25 0:32 / /mnt/cloud\\040files rw - fuse.rclone alias: rw\n"
         with patch.object(Path, "read_text", return_value=table):
             self.assertEqual(backup.mounted_rclone_paths(), (Path("/mnt/cloud files"),))
+
+    def test_restic_browse_mount_is_also_blocked_as_backup_source(self):
+        table = "36 25 0:32 / /mnt/backups ro - fuse restic:123456 ro\n"
+        with patch.object(Path, "read_text", return_value=table):
+            self.assertEqual(backup.mounted_rclone_paths(), (Path("/mnt/backups"),))
 
     def test_restore_refuses_other_profile_sources(self):
         self.write_config(extra=f'\n[[profiles]]\nname="projects"\nsources=["{self.projects}"]\n')

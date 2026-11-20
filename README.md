@@ -26,6 +26,10 @@ pinned to the running image digests.
 
 ## Versioned file backups (optional Phase 1)
 
+Start with [the operation and maintenance overview](docs/OVERVIEW.md) for this
+machine's profiles, everyday commands, read-only browsing, restores and recovery
+precautions.
+
 See [the backup workflow](docs/BACKUP-WORKFLOW.md) for manually selected directory
 profiles, encrypted Restic snapshots through the custom TelDrive rclone backend,
 and safe restores to a separate directory. This complements, rather than replaces,

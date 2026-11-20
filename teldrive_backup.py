@@ -18,6 +18,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import tomllib
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -147,8 +148,9 @@ def mounted_rclone_paths() -> tuple[Path, ...]:
     paths = []
     for line in Path("/proc/self/mountinfo").read_text().splitlines():
         before, after = line.split(" - ", 1)
-        filesystem = after.split()[0]
-        if filesystem == "fuse.rclone" or "teldrive" in filesystem.lower():
+        filesystem, mount_source = after.split()[:2]
+        if (filesystem == "fuse.rclone" or "teldrive" in filesystem.lower()
+                or mount_source.startswith("restic:")):
             mount = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), before.split()[4])
             paths.append(Path(mount).resolve())
     return tuple(paths)
@@ -321,6 +323,117 @@ def restore_target(raw: str, settings: Settings, profile: Profile) -> Path:
     return target
 
 
+def config_text(data: dict) -> str:
+    """Serialize the validated configuration schema without a TOML dependency.
+
+    Comments/formatting are intentionally normalized; unknown keys are rejected
+    by load_settings before this is called. JSON strings are TOML basic strings.
+    """
+    def literal(value: object) -> str:
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, list):
+            return "[" + ", ".join(literal(item) for item in value) + "]"
+        if isinstance(value, str):
+            return json.dumps(value, ensure_ascii=False)
+        raise BackupError("unsupported configuration value")
+
+    lines = ["# Managed by teldrive-backup dirs; manual edits are supported."]
+    for section in ("repository", "safety"):
+        if section in data:
+            lines.extend(["", f"[{section}]"])
+            lines.extend(f"{key} = {literal(value)}" for key, value in data[section].items())
+    for profile in data["profiles"]:
+        lines.extend(["", "[[profiles]]"])
+        lines.extend(f"{key} = {literal(value)}" for key, value in profile.items())
+    return "\n".join(lines) + "\n"
+
+
+def edit_directory(config_path: Path, action: str, name: str, raw_source: str,
+                   *, assume_yes: bool = False) -> None:
+    """Validate and atomically update sources, retaining the original config."""
+    if not PROFILE_RE.fullmatch(name):
+        raise BackupError("invalid profile name")
+    with exclusive_backup_lock():
+        if config_path.is_symlink() or not config_path.is_file():
+            raise BackupError("directory editor requires a regular non-symlink config")
+        original = config_path.read_bytes()
+        load_settings(config_path)  # Reject unknown schema before serializing.
+        data = tomllib.loads(original.decode("utf-8"))
+        source = expand_path(raw_source, "source")
+        profile = next((p for p in data["profiles"] if p["name"] == name), None)
+        if action == "add":
+            if profile is None:
+                profile = {"name": name, "sources": [], "excludes": [], "one_file_system": True}
+                data["profiles"].append(profile)
+            if any(expand_path(p, "source") == source for p in profile["sources"]):
+                raise BackupError("directory is already selected in this profile")
+            profile["sources"].append(str(source))
+        elif action == "remove":
+            if profile is None:
+                raise BackupError(f"unknown profile: {name}")
+            retained = [p for p in profile["sources"] if expand_path(p, "source") != source]
+            if len(retained) == len(profile["sources"]):
+                raise BackupError("directory is not selected in this profile")
+            profile["sources"] = retained
+            if not retained:
+                if len(data["profiles"]) == 1:
+                    raise BackupError("cannot remove the last directory of the last profile; the config requires at least one source")
+                data["profiles"].remove(profile)
+                print(f"This also removes profile '{name}' from the config. Its saved history remains; re-add the same name to access it.")
+        else:
+            raise BackupError("directory action must be add or remove")
+
+        # Validate the candidate before any change to the active config. Keep the
+        # temporary file in the same directory for an atomic final replacement.
+        fd, temporary = tempfile.mkstemp(prefix=".config-edit-", dir=config_path.parent)
+        candidate = Path(temporary)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(config_text(data))
+                handle.flush()
+                os.fsync(handle.fileno())
+            settings = load_settings(candidate)
+            if action == "add":
+                preflight_sources(settings, settings.profiles[name])
+            print(f"{action.capitalize()} {source} {'to' if action == 'add' else 'from'} profile '{name}'.")
+            print("Only configuration changes. No backup, restore, or deletion will run.")
+            print("Config comments/formatting will be normalized; original bytes will be saved separately.")
+            if not assume_yes:
+                if not sys.stdin.isatty():
+                    raise BackupError("confirmation requires a terminal; use --yes for an explicit noninteractive change")
+                if input("Save this change? [y/N] ").strip().lower() != "y":
+                    print("Cancelled; configuration unchanged.")
+                    return
+            if config_path.is_symlink() or config_path.read_bytes() != original:
+                raise BackupError("config changed during editing; refusing to overwrite it")
+            backup_fd, backup_name = tempfile.mkstemp(prefix="config.toml.before-dirs-", dir=config_path.parent)
+            with os.fdopen(backup_fd, "wb") as handle:
+                handle.write(original)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(candidate, config_path)
+            print(f"Saved {config_path}. Previous config: {backup_name}")
+        finally:
+            candidate.unlink(missing_ok=True)
+
+
+def directory_menu(config_path: Path, settings: Settings) -> None:
+    if not sys.stdin.isatty():
+        raise BackupError("the directory menu needs a terminal; use 'dirs list', 'dirs add' or 'dirs remove'")
+    for profile in settings.profiles.values():
+        print(f"{profile.name}:")
+        for source in profile.sources:
+            print(f"  {source}")
+    action = input("Add or remove a directory? [a/r, Enter to cancel] ").strip().lower()
+    if action not in {"a", "r"}:
+        print("Cancelled; configuration unchanged.")
+        return
+    name = input("Profile name (adding can create a new profile): ").strip()
+    source = input("Directory path (spaces are OK; do not add shell quotes): ").strip()
+    edit_directory(config_path, "add" if action == "a" else "remove", name, source)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=DEFAULT_CONFIG, help="TOML configuration file")
@@ -328,6 +441,16 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser("profiles", help="show configured source directories")
     commands.add_parser("keygen", help="generate a new protected Restic password file")
     commands.add_parser("init", help="initialize the remote Restic repository once")
+    browse = commands.add_parser("browse", help="browse snapshots through a foreground read-only FUSE mount")
+    browse.add_argument("--target", default="~/Mounts/teldrive-backups", help="empty local mount directory")
+    dirs = commands.add_parser("dirs", help="add/remove source directories or open the interactive menu")
+    directory_commands = dirs.add_subparsers(dest="directory_action")
+    directory_commands.add_parser("list", help="list configured sources")
+    for action in ("add", "remove"):
+        change = directory_commands.add_parser(action, help=f"{action} a directory from a profile")
+        change.add_argument("profile")
+        change.add_argument("source", help="absolute or home-relative directory")
+        change.add_argument("--yes", action="store_true", help="save without interactive confirmation")
     for name, help_text in (("run", "back up a selected profile"), ("snapshots", "list a profile's versions")):
         p = commands.add_parser(name, help=help_text)
         p.add_argument("profile", help="configured profile name")
@@ -341,19 +464,34 @@ def main(argv: list[str] | None = None) -> int:
     os.umask(0o077)
 
     try:
-        config_path = Path(os.path.expandvars(args.config)).expanduser().resolve(strict=False)
+        config_path = Path(os.path.abspath(Path(os.path.expandvars(args.config)).expanduser()))
         settings = load_settings(config_path)
-        if args.command == "profiles":
+        if args.command == "profiles" or (args.command == "dirs" and args.directory_action == "list"):
             for profile in settings.profiles.values():
                 print(f"{profile.name}:")
                 for source in profile.sources:
                     print(f"  {source}")
+        elif args.command == "dirs":
+            if args.directory_action is None:
+                directory_menu(config_path, settings)
+            else:
+                edit_directory(config_path, args.directory_action, args.profile, args.source, assume_yes=args.yes)
         elif args.command == "keygen":
             generate_password(settings.password_file)
         elif args.command == "init":
             with exclusive_backup_lock():
                 run_restic(settings, ["init"])
             print("Repository initialized. Keep the Restic password and rclone keys separately.")
+        elif args.command == "browse":
+            # Reuse restore destination protection for all configured sources.
+            profile = next(iter(settings.profiles.values()))
+            target = restore_target(args.target, settings, profile)
+            if os.path.ismount(target):
+                raise BackupError("browse target is already mounted")
+            target.mkdir(parents=True, exist_ok=True, mode=0o700)
+            print(f"Mounting snapshots read-only at {target}. Keep this terminal open.", flush=True)
+            print("Use fusermount -u on this directory from another terminal to unmount.", flush=True)
+            run_restic(settings, ["mount", str(target)])
         else:
             profile = settings.profiles.get(args.profile)
             if profile is None:
@@ -393,7 +531,7 @@ def main(argv: list[str] | None = None) -> int:
                     run_restic(settings, ["restore", snapshot_id, "--target", str(target), "--overwrite", "never"])
                 print(f"Restore complete: {target}")
         return 0
-    except (BackupError, OSError) as exc:
+    except (BackupError, OSError, EOFError, tomllib.TOMLDecodeError, UnicodeError) as exc:
         print(f"teldrive-backup: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

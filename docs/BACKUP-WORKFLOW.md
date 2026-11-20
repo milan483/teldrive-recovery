@@ -75,6 +75,13 @@ and access material, somewhere other than TelDrive.
 
 ## Back up a profile and browse versions
 
+To manage selected directories without editing TOML, use `teldrive-backup dirs`
+for an interactive menu, or `teldrive-backup dirs add PROFILE "/absolute/path"`
+and `teldrive-backup dirs remove PROFILE "/absolute/path"`. Changes require
+confirmation and preserve a private previous-config copy. Removing sources does
+not delete snapshots or source files. See [the overview](OVERVIEW.md#6-configuration-and-maintenance)
+for details.
+
 ```bash
 python3 teldrive_backup.py run documents --dry-run
 python3 teldrive_backup.py run documents
@@ -101,6 +108,30 @@ An unplugged source whose mountpoint still exists as an empty directory cannot
 be distinguished from an intentionally empty source; check removable mounts yourself.
 
 ## Restore a version safely
+
+### Browse without restoring everything
+
+Run `teldrive-backup browse` (or `python3 teldrive_backup.py browse`) in a
+terminal. This mounts snapshots read-only at `~/Mounts/teldrive-backups` using
+Restic FUSE. Keep that terminal open and open the directory in Dolphin. Browse
+`snapshots/` for dated versions or `tags/` for profile-tagged versions; original
+absolute source paths appear underneath each snapshot. Files download on demand.
+No files appear until the first backup has completed. An existing mount may need
+to be unmounted and restarted to show newly created snapshots.
+
+To stop it from another terminal:
+
+```bash
+fusermount -u "$HOME/Mounts/teldrive-backups"
+```
+
+Use `browse --target /absolute/empty/local/directory` for a different location.
+The target must be empty, unmounted, outside configured sources and remote mounts,
+and have no symlink parents. FUSE and a working `fusermount` helper are required.
+Nothing is scheduled or mounted at login. This is a foreground, manual command.
+Copy files out to recover them; you cannot edit the backup through this mount.
+
+### Restore to local disk
 
 Choose a full or unambiguous snapshot ID from `snapshots`:
 
