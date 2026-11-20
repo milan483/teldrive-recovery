@@ -10,7 +10,18 @@ config="$HOME/.config/rclone/rclone.conf"
 units="$HOME/.config/systemd/user"
 trap 'printf "Restore failed at line %s. Existing restored data is retained; do not rerun over it.\n" "$LINENO" >&2' ERR
 
-[[ ${1:-} == '' || ${1:-} == --check ]] || die 'usage: bash restore.sh [--check]'
+usage() {
+	cat <<'EOF'
+Usage:
+  bash restore.sh [--check]
+  bash restore.sh --cleanup
+
+--check    Validate the extracted kit and destination without changing anything.
+--cleanup  Remove only a confirmed partial restore from this kit.
+EOF
+}
+
+[[ ${1:-} == '' || ${1:-} == --check || ${1:-} == --cleanup ]] || { usage >&2; exit 2; }
 [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || die 'this kit supports Linux x86-64 only'
 [[ $EUID != 0 ]] || die 'run as your normal desktop user, not with sudo'
 command -v pacman >/dev/null || die 'automatic restore currently supports Arch/CachyOS only'
@@ -20,6 +31,41 @@ for file in config/compose.yaml config/.env config/rclone.conf \
 	[[ -s "$kit/$file" && ! -L "$kit/$file" ]] || die "missing or empty kit file: $file"
 done
 (cd "$kit" && sha256sum --check --quiet SHA256SUMS)
+
+cleanup_partial() {
+	local volumes containers
+	volumes=$(podman volume ls --format '{{.Name}}' | grep -E '(^|[-_])teldrive([-_].*)?$' || true)
+	containers=$(podman ps -aq \
+		--filter 'label=io.podman.compose.project=teldrive' \
+		--filter 'name=teldrive' || true)
+	if [[ -z "$volumes$containers" && ! -e "$root" && ! -e "$config" ]]; then
+		printf 'No partial TelDrive restore was found.\n'
+		return 0
+	fi
+	printf 'This removes only the following detected partial state:\n'
+	[[ -n "$containers" ]] && printf 'containers:\n%s\n' "$containers"
+	[[ -n "$volumes" ]] && printf 'volumes:\n%s\n' "$volumes"
+	[[ -e "$root" ]] && printf 'directory: %s\n' "$root"
+	[[ -e "$config" ]] && printf 'file: %s\n' "$config"
+	printf 'Continue? This is destructive and must only be used for a failed fresh restore. [y/N] '
+	read -r answer
+	[[ $answer == y || $answer == Y ]] || die 'cancelled; nothing was removed'
+	systemctl --user disable --now teldrive-mount.service teldrive-server.service 2>/dev/null || true
+	[[ -z "$containers" ]] || podman rm -f $containers >/dev/null
+	[[ -z "$volumes" ]] || podman volume rm $volumes >/dev/null
+	rm -rf -- "$root"
+	rm -f -- "$config" "$HOME/.local/bin/rclone-teldrive" \
+		"$units/teldrive-server.service" "$units/teldrive-mount.service"
+	systemctl --user daemon-reload
+	printf 'Partial restore removed. Run bash restore.sh to retry.\n'
+}
+
+if [[ ${1:-} == --cleanup ]]; then
+	[[ -t 0 ]] || die '--cleanup requires an interactive terminal'
+	cleanup_partial
+	exit 0
+fi
+
 for path in "$root" "$config" "$HOME/.local/bin/rclone-teldrive" \
 	"$units/teldrive-server.service" "$units/teldrive-mount.service"; do
 	[[ ! -e "$path" && ! -L "$path" ]] || die "refusing to overwrite existing path: $path"
@@ -47,8 +93,10 @@ export PODMAN_COMPOSE_PROVIDER
 PODMAN_COMPOSE_PROVIDER=$(command -v podman-compose)
 systemctl --user enable --now podman.socket
 # The kit uses the original project name and must not attach to an old volume.
-[[ -z $(podman volume ls -q --filter name='^teldrive_postgres-data$') ]] || die 'existing TelDrive database volume found'
-[[ -z $(podman ps -aq --filter name='^teldrive[-_]') ]] || die 'existing TelDrive containers found'
+existing_volumes=$(podman volume ls --format '{{.Name}}' | grep -E '(^|[-_])teldrive([-_].*)?$' || true)
+existing_containers=$(podman ps -aq --filter 'label=io.podman.compose.project=teldrive' --filter 'name=teldrive' || true)
+[[ -z "$existing_volumes" ]] || die "existing TelDrive volume found; if this is a failed fresh restore run: bash restore.sh --cleanup"
+[[ -z "$existing_containers" ]] || die "existing TelDrive container found; if this is a failed fresh restore run run: bash restore.sh --cleanup"
 if curl -s --connect-timeout 2 http://127.0.0.1:8080/ >/dev/null; then
 	die 'port 8080 already serves another application'
 fi

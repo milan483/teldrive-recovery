@@ -78,6 +78,11 @@ class RestoreChecks(unittest.TestCase):
         script = (self.kit / "restore.sh").read_text()
         self.assertIn("docker.io/library/postgres:18-alpine", script)
 
+    def test_script_has_explicit_partial_cleanup_mode(self):
+        script = (self.kit / "restore.sh").read_text()
+        self.assertIn("--cleanup", script)
+        self.assertIn("existing TelDrive volume found", script)
+
 
 if __name__ == "__main__":
     unittest.main()

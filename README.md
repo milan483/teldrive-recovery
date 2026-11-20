@@ -38,6 +38,18 @@ enables the encrypted mount. Internet access is required; Telegram may require
 reauthentication. A failed restore retains its data for diagnosis and is not
 automatically resumable.
 
+If a restore stops after creating a partial database volume, do not manually
+guess the volume name. On this fresh recovery computer run:
+
+```bash
+bash restore.sh --cleanup
+bash restore.sh
+```
+
+`--cleanup` lists the detected TelDrive containers, volumes, and paths, asks for
+confirmation, and removes only that partial state. It refuses to proceed unless
+you explicitly confirm. Never use it on a working installation.
+
 If a restore is interrupted before completion on a genuinely fresh computer,
 remove only the partial paths listed by the error, then rerun the script:
 
